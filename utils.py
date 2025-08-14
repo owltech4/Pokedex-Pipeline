@@ -10,10 +10,12 @@ Este módulo centraliza:
 
 import csv
 import io
+import time
+from pathlib import Path
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 
 import boto3
 import pandas as pd
@@ -142,3 +144,86 @@ def ensure_bucket_exists(s3_client, bucket: str, region: Optional[str] = None) -
                 )
         else:
             raise
+
+#---------- Redshift ---------------
+def redshift_execute_sql(
+    sql: str,
+    database: str,
+    workgroup: Optional[str] = None,          # Serverless
+    cluster_id: Optional[str] = None,         # Provisionado
+    secret_arn: Optional[str] = None,         # credencial (recomendado)
+    region_name: Optional[str] = None,
+    poll: bool = True,
+    timeout_s: int = 600,
+) -> str:
+    """
+    Executa um SQL via Redshift Data API e (opcionalmente) aguarda terminar.
+    Retorna o statement id.
+    """
+    if not (workgroup or cluster_id):
+        raise ValueError("Informe workgroup (Serverless) ou cluster_id (provisionado).")
+    client = boto3.client("redshift-data", region_name=region_name)
+    kwargs = {
+        "Database": database,
+        "Sql": sql,
+        "SecretArn": secret_arn,
+        "WithEvent": True,
+    }
+    if workgroup:
+        kwargs["WorkgroupName"] = workgroup
+    if cluster_id:
+        kwargs["ClusterIdentifier"] = cluster_id
+
+    resp = client.execute_statement(**kwargs)
+    stmt_id = resp["Id"]
+
+    if not poll:
+        return stmt_id
+
+    # espera concluir
+    start = time.time()
+    while True:
+        desc = client.describe_statement(Id=stmt_id)
+        status = desc["Status"]
+        if status in ("FINISHED", "FAILED", "ABORTED"):
+            if status != "FINISHED":
+                raise RuntimeError(f"Redshift SQL falhou: {desc.get('Error', 'unknown')}")
+            return stmt_id
+        if time.time() - start > timeout_s:
+            raise TimeoutError(f"Timeout aguardando statement {stmt_id}")
+        time.sleep(2)
+
+def render_sql_template(template_text: str, params: Dict[str, Any]) -> str:
+    """
+    Renderiza templates .sql usando Python format: {PLACEHOLDER}.
+    """
+    return template_text.format(**params)
+
+def exec_sql_file(
+    file_path: str,
+    params: Dict[str, Any],
+    database: str,
+    workgroup: Optional[str] = None,
+    cluster_id: Optional[str] = None,
+    secret_arn: Optional[str] = None,
+    region_name: Optional[str] = None,
+) -> None:
+    """
+    Lê um .sql, aplica params e executa via Data API.
+    Suporta múltiplos statements separados por ';'.
+    """
+    sql_raw = Path(file_path).read_text(encoding="utf-8")
+    sql = render_sql_template(sql_raw, params)
+
+    # split simples; se tiver ponto-e-vírgula dentro de string, ajuste conforme necessário
+    statements = [s.strip() for s in sql.split(";") if s.strip()]
+    for stmt in statements:
+        redshift_execute_sql(
+            sql=stmt,
+            database=database,
+            workgroup=workgroup,
+            cluster_id=cluster_id,
+            secret_arn=secret_arn,
+            region_name=region_name,
+            poll=True,
+        )
