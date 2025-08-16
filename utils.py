@@ -151,7 +151,7 @@ def redshift_execute_sql(
     database: str,
     workgroup: Optional[str] = None,          # Serverless
     cluster_id: Optional[str] = None,         # Provisionado
-    secret_arn: Optional[str] = None,         # credencial (recomendado)
+    secret_arn: Optional[str] = None,         # pode ficar None (IAM sem Secret)
     region_name: Optional[str] = None,
     poll: bool = True,
     timeout_s: int = 600,
@@ -166,9 +166,10 @@ def redshift_execute_sql(
     kwargs = {
         "Database": database,
         "Sql": sql,
-        "SecretArn": secret_arn,
         "WithEvent": True,
     }
+    if secret_arn:                 # <-- só inclui se houver
+        kwargs["SecretArn"] = secret_arn
     if workgroup:
         kwargs["WorkgroupName"] = workgroup
     if cluster_id:
@@ -227,3 +228,51 @@ def exec_sql_file(
             region_name=region_name,
             poll=True,
         )
+def redshift_table_exists(
+    schema: str,
+    table: str,
+    database: str,
+    workgroup: Optional[str] = None,
+    cluster_id: Optional[str] = None,
+    secret_arn: Optional[str] = None,
+    region_name: Optional[str] = None,
+    timeout_s: int = 60,
+) -> bool:
+    client = boto3.client("redshift-data", region_name=region_name)
+    sql = f"""
+    select 1
+    from svv_external_tables
+    where schemaname = '{schema.lower()}'
+      and tablename  = '{table.lower()}'
+    limit 1
+    """
+    kwargs = {
+        "Database": database,
+        "Sql": sql,
+        "WithEvent": False,
+    }
+    if secret_arn:
+        kwargs["SecretArn"] = secret_arn
+    if workgroup:
+        kwargs["WorkgroupName"] = workgroup
+    if cluster_id:
+        kwargs["ClusterIdentifier"] = cluster_id
+
+    resp = client.execute_statement(**kwargs)
+    stmt_id = resp["Id"]
+
+    # poll simples
+    start = time.time()
+    while True:
+        desc = client.describe_statement(Id=stmt_id)
+        st = desc["Status"]
+        if st in ("FAILED", "ABORTED"):
+            raise RuntimeError(f"Falha ao checar tabela externa: {desc.get('Error','unknown')}")
+        if st == "FINISHED":
+            break
+        if time.time() - start > timeout_s:
+            raise TimeoutError("Timeout checando existência da tabela externa")
+        time.sleep(0.5)
+
+    res = client.get_statement_result(Id=stmt_id)
+    return len(res.get("Records", [])) > 0
