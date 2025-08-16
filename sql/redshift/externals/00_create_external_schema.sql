@@ -1,4 +1,3 @@
--- Cria o schema externo do Spectrum usando o Glue Data Catalog
 CREATE EXTERNAL SCHEMA IF NOT EXISTS {EXTERNAL_SCHEMA}
 FROM DATA CATALOG
 DATABASE '{GLUE_DATABASE}'
